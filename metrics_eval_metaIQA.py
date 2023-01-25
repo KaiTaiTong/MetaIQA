@@ -1,36 +1,55 @@
-from __future__ import print_function, division
 import os
 import torch
 from torch import nn
 import pandas as pd
-from skimage import transform
 import numpy as np
+from PIL import Image
+from skimage import transform
+from torchvision import transforms
+from torchvision import models
+from tqdm import tqdm
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from torchvision import transforms
-
-from PIL import Image
-import time
-import math
-import copy
-from sklearn.model_selection import train_test_split
-import torch.optim as optim
 from torch.autograd import Variable
-from torchvision import models
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
+import matplotlib.pyplot as plt
 # from SPP_layer import SPPLayer
-
-import warnings
-
-warnings.filterwarnings("ignore")
-import random
-from scipy.stats import spearmanr, pearsonr
 
 use_gpu = True
 Image.LOAD_TRUNCATED_IMAGES = True
+
+
+class LocalEditingDataset(Dataset):
+
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.img_filepath = [
+            os.path.join(root_dir, i) for i in os.listdir(root_dir) if any(
+                [i.endswith('.png'),
+                 i.endswith('.JPG'),
+                 i.endswith('.bmp')])
+        ]
+        self.img_filepath = self.img_filepath
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.img_filepath)
+
+    def __getitem__(self, idx):
+        img_name = self.img_filepath[idx]
+        im = Image.open(img_name).convert('RGB')
+        if im.mode == 'P':
+            im = im.convert('RGB')
+        image = np.asarray(im)
+        sample = {'image': image, 'rating': -1}
+
+        if self.transform:
+            sample = self.transform(sample)
+
+        return img_name, sample
 
 
 class ImageRatingsDataset(Dataset):
@@ -245,141 +264,20 @@ class Net(nn.Module):
         return x
 
 
-def computeSpearman(dataloader_valid, model):
-    ratings = []
-    predictions = []
-    with torch.no_grad():
-        cum_loss = 0
-        for batch_idx, data in enumerate(dataloader_valid):
-            inputs = data['image']
-            batch_size = inputs.size()[0]
-            labels = data['rating'].view(batch_size, -1)
-            # labels = labels / 100.0
-            if use_gpu:
-                try:
-                    inputs, labels = Variable(inputs.float().cuda()), Variable(
-                        labels.float().cuda())
-                except:
-                    print(inputs, labels)
-            else:
-                inputs, labels = Variable(inputs), Variable(labels)
-
-            outputs_a = model(inputs)
-            ratings.append(labels.float())
-            predictions.append(outputs_a.float())
-
-    ratings_i = np.vstack(ratings)
-    predictions_i = np.vstack(predictions)
-    a = ratings_i[:, 0]
-    b = predictions_i[:, 0]
-    sp = spearmanr(a, b)[0]
-    pl = pearsonr(a, b)[0]
-    return sp, pl
+def convert_batch_scores_to_list(batch_scores):
+    results = []
+    for i in batch_scores:
+        for element in i.cpu().detach().numpy():
+            results.append(element[0])
+    return results
 
 
-def finetune_model():
-    epochs = 100
-    srocc_l = []
-
-    # data_dir = os.path.join('LIVE_WILD')
-    # images = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_score.csv'),
-    #                      sep=',')
-
-    images_fold = "LIVE_WILD/"
-    if not os.path.exists(images_fold):
-        os.makedirs(images_fold)
-    for i in range(10):
-        # images_train, images_test = train_test_split(images, train_size=0.8)
-
-        # train_path = images_fold + "train_image" + ".csv"
-        # test_path = images_fold + "test_image" + ".csv"
-        # images_train.to_csv(train_path, sep=',', index=False)
-        # images_test.to_csv(test_path, sep=',', index=False)
-
-        model = torch.load('model_IQA/TID2013_IQA_Meta_resnet18.pt')
-        criterion = nn.MSELoss()
-
-        optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
-        model.cuda()
-
-        spearman = 0
-        for epoch in range(epochs):
-            optimizer = exp_lr_scheduler(optimizer, epoch)
-
-            if epoch == 0:
-                dataloader_valid = load_data('train')
-                model.eval()
-
-                sp = computeSpearman(dataloader_valid, model)[0]
-                if sp > spearman:
-                    spearman = sp
-                print('no train srocc {:4f}'.format(sp))
-
-            # Iterate over data.
-            #print('############# train phase epoch %2d ###############' % epoch)
-            dataloader_train = load_data('train')
-            model.train()  # Set model to training mode
-
-            epoch_train_loss = 0
-            for batch_idx, data in enumerate(dataloader_train):
-                inputs = data['image']
-                batch_size = inputs.size()[0]
-                labels = data['rating'].view(batch_size, -1)
-                # labels = labels / 100.0
-                if use_gpu:
-                    try:
-                        inputs, labels = Variable(
-                            inputs.float().cuda()), Variable(
-                                labels.float().cuda())
-                    except:
-                        print(inputs, labels)
-                else:
-                    inputs, labels = Variable(inputs), Variable(labels)
-
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-                
-                epoch_train_loss += loss.item()
-                
-            epoch_train_loss /= len(dataloader_train)
-            print(epoch_train_loss)
-
-            #print('############# test phase epoch %2d ###############' % epoch)
-            dataloader_valid = load_data('test')
-            model.eval()
-
-            sp, pl = computeSpearman(dataloader_valid, model)
-            if sp > spearman:
-                spearman = sp
-            print(
-                'Validation Results - Epoch: {:2d}, PLCC: {:4f}, SROCC: {:4f}, '
-                'best SROCC: {:4f}'.format(epoch, pl, sp, spearman))
-
-        srocc_l.append(spearman)
-        
-        # save model
-        torch.save(model, './model_IQA/fine_tuned_model.pt')
-
-    ind = 'Results/LIVEWILD'
-    file = pd.DataFrame(columns=[ind], data=srocc_l)
-    file.to_csv(ind+'.csv')
-    print('average srocc {:4f}'.format(np.mean(srocc_l)))
-
-
-def exp_lr_scheduler(optimizer, epoch, lr_decay_epoch=10):
-    """Decay learning rate by a factor of DECAY_WEIGHT every lr_decay_epoch epochs."""
-
-    decay_rate = 0.8**(epoch // lr_decay_epoch)
-    if epoch % lr_decay_epoch == 0:
-        print('decay_rate is set to {}'.format(decay_rate))
-
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = param_group['lr'] * decay_rate
-
-    return optimizer
+def convert_batch_str_to_list(batch_str):
+    results = []
+    for i in batch_str:
+        for element in i:
+            results.append(element)
+    return results
 
 
 def my_collate(batch):
@@ -413,6 +311,17 @@ def load_data(mod='train'):
             Normalize(),
             ToTensor(),
         ]))
+    transformed_dataset_nolabel = LocalEditingDataset(
+        # root_dir='../local-editing-dataset/reconstructed_imgs/',
+        # root_dir='../local-editing-dataset/experiment/test/unfiltered/nose/',
+        # root_dir='../local-editing-dataset/real_imgs/',
+        root_dir='~/projects/def-panos/alantkt/datasets/seq-deepfake/facial_components/full_set/eye/',
+        transform=transforms.Compose([
+            Rescale(output_size=(224, 224)),
+            Normalize(),
+            ToTensor(),
+        ]))
+
     bsize = meta_num
 
     if mod == 'train':
@@ -421,8 +330,14 @@ def load_data(mod='train'):
                                 shuffle=False,
                                 num_workers=0,
                                 collate_fn=my_collate)
-    else:
+    elif mod == 'valid':
         dataloader = DataLoader(transformed_dataset_valid,
+                                batch_size=50,
+                                shuffle=False,
+                                num_workers=0,
+                                collate_fn=my_collate)
+    else:
+        dataloader = DataLoader(transformed_dataset_nolabel,
                                 batch_size=50,
                                 shuffle=False,
                                 num_workers=0,
@@ -431,4 +346,32 @@ def load_data(mod='train'):
     return dataloader
 
 
-finetune_model()
+dataloader_test = load_data('test')
+model = torch.load('model_IQA/fine_tuned_model.pt')
+# model = torch.load('model_IQA/TID2013_KADID10K_IQA_Meta_resnet18.pt')
+# model = torch.load('model_IQA/TID2013_IQA_Meta_resnet18.pt')
+
+model.cuda()
+model.to(torch.device('cuda'))
+model.eval()
+
+
+pred = []
+img_name_list = []
+with torch.no_grad():
+    for idx, (img_name, data) in enumerate(tqdm(dataloader_test)):
+
+        inputs, labels = data['image'], data['rating']
+        batch_size = inputs.size()[0]
+
+        inputs, labels = Variable(inputs.float().cuda()), Variable(labels.float().cuda())
+
+        outputs = model(inputs)
+        pred.append(outputs.float())
+        img_name_list.append(img_name)
+        
+pred = convert_batch_scores_to_list(pred)
+img_name_list = convert_batch_str_to_list(img_name_list)
+with open('results_seq.txt', 'w') as f:
+    for i, p in enumerate(pred):
+        f.write(img_name_list[i] + ',' + str(p) + '\n')

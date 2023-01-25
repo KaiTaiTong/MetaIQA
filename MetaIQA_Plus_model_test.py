@@ -1,6 +1,21 @@
 from __future__ import print_function, division
 import os
 import torch
+
+# Monkey-patch because I trained with a newer version.
+# This can be removed once PyTorch 0.4.x is out.
+# See https://discuss.pytorch.org/t/question-about-rebuild-tensor-v2/14560
+import torch._utils
+# try:
+#     torch._utils._rebuild_tensor_v2
+# except AttributeError:
+#     def _rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad, backward_hooks):
+#         tensor = torch._utils._rebuild_tensor(storage, storage_offset, size, stride)
+#         tensor.requires_grad = requires_grad
+#         tensor._backward_hooks = backward_hooks
+#         return tensor
+#     torch._utils._rebuild_tensor_v2 = _rebuild_tensor_v2
+
 from torch import nn
 import pandas as pd
 from skimage import transform
@@ -14,23 +29,24 @@ from PIL import Image
 import time
 import math
 import copy
-from sklearn.model_selection import train_test_split
+# from sklearn.model_selection import train_test_split
 import torch.optim as optim
 from torch.autograd import Variable
 from torchvision import models
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-# from SPP_layer import SPPLayer
-
 import warnings
 
 warnings.filterwarnings("ignore")
 import random
+from scipy.optimize import curve_fit
 from scipy.stats import spearmanr, pearsonr
 
 use_gpu = True
 Image.LOAD_TRUNCATED_IMAGES = True
+
+from SPP_layer import SPPLayer
 
 
 class ImageRatingsDataset(Dataset):
@@ -74,7 +90,6 @@ class ImageRatingsDataset(Dataset):
 
 class Rescale(object):
     """Rescale the image in a sample to a given size.
-
     Args:
         output_size (tuple or int): Desired output size. If tuple, output is
             matched to output_size. If int, smaller of image edges is matched
@@ -105,7 +120,6 @@ class Rescale(object):
 
 class RandomCrop(object):
     """Crop randomly the image in a sample.
-
     Args:
         output_size (tuple or int): Desired output size. If int, square crop
             is made.
@@ -153,6 +167,7 @@ class Normalize(object):
 
     def __call__(self, sample):
         image, rating = sample['image'], sample['rating']
+        image = image / 255.0
         im = image / 1.0  #/ 255
         im[:, :, 0] = (image[:, :, 0] - 0.485) / 0.229
         im[:, :, 1] = (image[:, :, 1] - self.means[1]) / self.stds[1]
@@ -183,16 +198,16 @@ class BaselineModel1(nn.Module):
     def __init__(self, num_classes, keep_probability, inputsize):
 
         super(BaselineModel1, self).__init__()
-        self.fc1 = nn.Linear(inputsize, 1024)
-        self.bn1 = nn.BatchNorm1d(1024)
+        self.fc1 = nn.Linear(inputsize, 512)
+        self.bn1 = nn.BatchNorm1d(512)
         self.drop_prob = (1 - keep_probability)
         self.relu1 = nn.PReLU()
         self.drop1 = nn.Dropout(self.drop_prob)
-        self.fc2 = nn.Linear(1024, 512)
-        self.bn2 = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
         self.relu2 = nn.PReLU()
         self.drop2 = nn.Dropout(p=self.drop_prob)
-        self.fc3 = nn.Linear(512, num_classes)
+        self.fc3 = nn.Linear(256, num_classes)
         self.sig = nn.Sigmoid()
 
         for m in self.modules():
@@ -245,16 +260,20 @@ class Net(nn.Module):
         return x
 
 
+def logistic(X, beta1, beta2, beta3, beta4, beta5):
+    logisticPart = 0.5 - 1. / (1.0 + np.exp(beta2 * (X - beta3)))
+    return beta1 * logisticPart * beta4 + beta5
+
+
 def computeSpearman(dataloader_valid, model):
     ratings = []
     predictions = []
     with torch.no_grad():
-        cum_loss = 0
         for batch_idx, data in enumerate(dataloader_valid):
             inputs = data['image']
             batch_size = inputs.size()[0]
             labels = data['rating'].view(batch_size, -1)
-            # labels = labels / 100.0
+            labels = labels
             if use_gpu:
                 try:
                     inputs, labels = Variable(inputs.float().cuda()), Variable(
@@ -272,107 +291,52 @@ def computeSpearman(dataloader_valid, model):
     predictions_i = np.vstack(predictions)
     a = ratings_i[:, 0]
     b = predictions_i[:, 0]
-    sp = spearmanr(a, b)[0]
-    pl = pearsonr(a, b)[0]
-    return sp, pl
+    sp1 = spearmanr(a, b)
+    # sp11 = pearsonr(a, b)
+    popt, pconv = curve_fit(logistic,
+                            xdata=b,
+                            ydata=a,
+                            p0=(np.max(a), 0, np.mean(b), 0.1, 0.1),
+                            maxfev=20000)
+    b1 = logistic(b, popt[0], popt[1], popt[2], popt[3], popt[4])
+    sp2 = pearsonr(a, b1)
+    return sp1[0], sp2[0]
 
 
-def finetune_model():
-    epochs = 100
-    srocc_l = []
-
-    # data_dir = os.path.join('LIVE_WILD')
-    # images = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_score.csv'),
-    #                      sep=',')
+def eval_model(data_dir, images):
 
     images_fold = "LIVE_WILD/"
     if not os.path.exists(images_fold):
         os.makedirs(images_fold)
-    for i in range(10):
-        # images_train, images_test = train_test_split(images, train_size=0.8)
 
-        # train_path = images_fold + "train_image" + ".csv"
-        # test_path = images_fold + "test_image" + ".csv"
+    for i in range(10):
+        print('############# repeat time %2d ###############' % (i + 1))
+        # images_train, images_test = train_test_split(images, train_size=0.5)
+
+        # train_path = images_fold + "train_image.csv"
+        # test_path = images_fold + "test_image.csv"
         # images_train.to_csv(train_path, sep=',', index=False)
         # images_test.to_csv(test_path, sep=',', index=False)
 
-        model = torch.load('model_IQA/TID2013_IQA_Meta_resnet18.pt')
-        criterion = nn.MSELoss()
+        model = torch.load('./model_IQA/MetaIQA_Plus_Model.pt')
+        # model.net.drop1 = nn.Dropout(0.1)
+        # model.net.drop2 = nn.Dropout(0.1)
 
-        optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
         model.cuda()
+        model.to(torch.device('cuda'))
 
-        spearman = 0
-        for epoch in range(epochs):
-            optimizer = exp_lr_scheduler(optimizer, epoch)
+        model.eval()
 
-            if epoch == 0:
-                dataloader_valid = load_data('train')
-                model.eval()
-
-                sp = computeSpearman(dataloader_valid, model)[0]
-                if sp > spearman:
-                    spearman = sp
-                print('no train srocc {:4f}'.format(sp))
-
-            # Iterate over data.
-            #print('############# train phase epoch %2d ###############' % epoch)
-            dataloader_train = load_data('train')
-            model.train()  # Set model to training mode
-
-            epoch_train_loss = 0
-            for batch_idx, data in enumerate(dataloader_train):
-                inputs = data['image']
-                batch_size = inputs.size()[0]
-                labels = data['rating'].view(batch_size, -1)
-                # labels = labels / 100.0
-                if use_gpu:
-                    try:
-                        inputs, labels = Variable(
-                            inputs.float().cuda()), Variable(
-                                labels.float().cuda())
-                    except:
-                        print(inputs, labels)
-                else:
-                    inputs, labels = Variable(inputs), Variable(labels)
-
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-                
-                epoch_train_loss += loss.item()
-                
-            epoch_train_loss /= len(dataloader_train)
-            print(epoch_train_loss)
-
-            #print('############# test phase epoch %2d ###############' % epoch)
-            dataloader_valid = load_data('test')
-            model.eval()
-
-            sp, pl = computeSpearman(dataloader_valid, model)
-            if sp > spearman:
-                spearman = sp
-            print(
-                'Validation Results - Epoch: {:2d}, PLCC: {:4f}, SROCC: {:4f}, '
-                'best SROCC: {:4f}'.format(epoch, pl, sp, spearman))
-
-        srocc_l.append(spearman)
-        
-        # save model
-        torch.save(model, './model_IQA/fine_tuned_model.pt')
-
-    ind = 'Results/LIVEWILD'
-    file = pd.DataFrame(columns=[ind], data=srocc_l)
-    file.to_csv(ind+'.csv')
-    print('average srocc {:4f}'.format(np.mean(srocc_l)))
+        dataloader_valid = load_data('test', data_dir, i + 1)
+        sp = computeSpearman(dataloader_valid, model)[0]
+        pe = computeSpearman(dataloader_valid, model)[1]
+        print('test srocc {:4f}, plcc {:4f}'.format(sp, pe))
 
 
-def exp_lr_scheduler(optimizer, epoch, lr_decay_epoch=10):
+def exp_lr_scheduler(optimizer, epoch, lr_decay_epoch=50):
     """Decay learning rate by a factor of DECAY_WEIGHT every lr_decay_epoch epochs."""
 
-    decay_rate = 0.8**(epoch // lr_decay_epoch)
+    decay_rate = 0.1**(epoch // lr_decay_epoch)
     if epoch % lr_decay_epoch == 0:
         print('decay_rate is set to {}'.format(decay_rate))
 
@@ -387,29 +351,27 @@ def my_collate(batch):
     return default_collate(batch)
 
 
-def load_data(mod='train'):
-
+def load_data(mod, root_dir, num):
+    root_dir = os.path.join(root_dir, 'images')
     meta_num = 50
     data_dir = os.path.join('LIVE_WILD/')
-    train_path = os.path.join(data_dir, 'train_image.csv')
-    test_path = os.path.join(data_dir, 'test_image.csv')
+    train_path = os.path.join(data_dir, "train_image.csv")
+    test_path = os.path.join(data_dir, "test_image.csv")
 
-    output_size = (224, 224)
+    # output_size = (500, 500)
     transformed_dataset_train = ImageRatingsDataset(
         csv_file=train_path,
-        root_dir='./LIVE_WILD/images/',
+        root_dir=root_dir,
         transform=transforms.Compose([
-            Rescale(output_size=(256, 256)),
-            RandomHorizontalFlip(0.5),
-            RandomCrop(output_size=output_size),
+            # RandomCrop(
+            #     output_size=output_size),
             Normalize(),
             ToTensor(),
         ]))
     transformed_dataset_valid = ImageRatingsDataset(
         csv_file=test_path,
-        root_dir='./LIVE_WILD/images/',
+        root_dir=root_dir,
         transform=transforms.Compose([
-            Rescale(output_size=(224, 224)),
             Normalize(),
             ToTensor(),
         ]))
@@ -423,7 +385,7 @@ def load_data(mod='train'):
                                 collate_fn=my_collate)
     else:
         dataloader = DataLoader(transformed_dataset_valid,
-                                batch_size=50,
+                                batch_size=1,
                                 shuffle=False,
                                 num_workers=0,
                                 collate_fn=my_collate)
@@ -431,4 +393,8 @@ def load_data(mod='train'):
     return dataloader
 
 
-finetune_model()
+data_dir = os.path.join('LIVE_WILD')
+images = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_score.csv'),
+                     sep=',')
+
+eval_model(data_dir, images)
