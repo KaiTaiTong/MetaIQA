@@ -30,7 +30,8 @@ class LocalEditingDataset(Dataset):
             os.path.join(root_dir, i) for i in os.listdir(root_dir) if any(
                 [i.endswith('.png'),
                  i.endswith('.JPG'),
-                 i.endswith('.bmp')])
+                 i.endswith('.bmp'), 
+                 i.endswith('.jpg')])
         ]
         self.img_filepath = self.img_filepath
         self.transform = transform
@@ -315,7 +316,7 @@ def load_data(mod='train'):
         # root_dir='../local-editing-dataset/reconstructed_imgs/',
         # root_dir='../local-editing-dataset/experiment/test/unfiltered/nose/',
         # root_dir='../local-editing-dataset/real_imgs/',
-        root_dir='~/projects/def-panos/alantkt/datasets/seq-deepfake/facial_components/full_set/eye/',
+        root_dir='../../datasets/seq-deepfake/facial_components/full_set/eye/',
         transform=transforms.Compose([
             Rescale(output_size=(224, 224)),
             Normalize(),
